@@ -16,6 +16,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
 # Configuration
 POSTGRES_CONFIG = {
     'host': 'enter.address.here',
@@ -118,11 +119,11 @@ TABLES = [
     'users',
     'pre_auth_keys',
     'pre_auth_key_acl_tags',
-    'nodes',
-    'migrations',
     'api_keys',
+    'nodes',
     'routes',
     'policies'
+    # Removed 'migrations' to avoid UNIQUE constraint violations
 ]
 
 # Mapping of tables to their special columns and conversion functions
@@ -208,19 +209,6 @@ def handle_column_mapping(df, table_name, sqlite_conn):
             logger.debug(f"Mapped 'machine_id' to 'node_id' for table '{table_name}'.")
     return df
 
-# Function to fetch related foreign keys from PostgreSQL for validation
-def fetch_related_foreign_keys(pg_conn, table_name, foreign_key_column, referenced_table):
-    query = f"""
-        SELECT DISTINCT {foreign_key_column}
-        FROM {table_name}
-        WHERE {foreign_key_column} IS NOT NULL
-        AND {foreign_key_column} NOT IN (SELECT id FROM {referenced_table});
-    """
-    with pg_conn.cursor() as cursor:
-        cursor.execute(query)
-        invalid_keys = cursor.fetchall()
-    return [key[0] for key in invalid_keys]
-
 # Function to recreate the `api_keys` table with the correct definition
 def recreate_api_keys_table(sqlite_conn):
     try:
@@ -231,13 +219,12 @@ def recreate_api_keys_table(sqlite_conn):
         # Recreate the api_keys table with the correct definition
         create_table_query = """
         CREATE TABLE "api_keys" (
-            "id" integer,
+            "id" integer PRIMARY KEY,
             "prefix" text UNIQUE,
             "hash" blob,
             "created_at" datetime,
             "expiration" datetime,
-            "last_seen" datetime,
-            PRIMARY KEY ("id")
+            "last_seen" datetime
         );
         """
         sqlite_conn.execute(create_table_query)
@@ -273,15 +260,16 @@ def migrate_table(pg_conn, sqlite_conn, table_name):
             pg_cursor.execute(f'SELECT * FROM {table_name};')
             rows = pg_cursor.fetchall()
             columns = [desc[0] for desc in pg_cursor.description]
-            row_count = len(rows)
-            logger.info(f"Fetched {row_count} rows from PostgreSQL table '{table_name}'.")
+            initial_row_count = len(rows)
+            logger.info(f"Fetched {initial_row_count} rows from PostgreSQL table '{table_name}'.")
 
-        if row_count == 0:
+        if initial_row_count == 0:
             logger.warning(f"No data found in PostgreSQL table '{table_name}'. Skipping migration.")
             return
 
         # Convert to DataFrame
         df = pd.DataFrame(rows, columns=columns)
+        logger.info(f"Initial DataFrame row count for '{table_name}': {len(df)}")
 
         # Handle column mapping
         df = handle_column_mapping(df, table_name, sqlite_conn)
@@ -293,26 +281,44 @@ def migrate_table(pg_conn, sqlite_conn, table_name):
                     logger.debug(f"Applying conversion for column '{col}' in table '{table_name}'.")
                     df[col] = df[col].apply(func)
 
-        # Check for invalid foreign key references if table has foreign keys
+        # Handle 'auth_key_id' in 'nodes' table
         if table_name == 'nodes' and 'auth_key_id' in df.columns:
-            # Filter out rows with invalid auth_key_id (e.g., auth_key_id = 0)
-            df = df[df['auth_key_id'] != 0]
-            logger.info(f"Filtered out rows with 'auth_key_id' = 0 from 'nodes' table.")
+            # Log distribution of auth_key_id values
+            logger.info(f"Distribution of auth_key_id values: {df['auth_key_id'].value_counts(dropna=False).to_dict()}")
 
-            invalid_auth_keys = fetch_related_foreign_keys(pg_conn, 'nodes', 'auth_key_id', 'pre_auth_keys')
-            if invalid_auth_keys:
+            # Replace 'auth_key_id' values of 0 with NULL
+            df['auth_key_id'] = df['auth_key_id'].replace(0, pd.NA)
+
+            # Fetch all valid 'auth_key_id's from 'pre_auth_keys'
+            with pg_conn.cursor() as cursor:
+                cursor.execute("SELECT id FROM pre_auth_keys;")
+                valid_auth_key_ids = set([row[0] for row in cursor.fetchall()])
+
+            # Identify invalid 'auth_key_id's in df
+            invalid_mask = df['auth_key_id'].notna() & ~df['auth_key_id'].isin(valid_auth_key_ids)
+
+            if invalid_mask.any():
+                invalid_auth_keys = df.loc[invalid_mask, 'auth_key_id'].unique()
                 logger.error(f"Foreign key constraint violation in table 'nodes' for 'auth_key_id'. Invalid keys: {invalid_auth_keys}")
-                df = df[~df['auth_key_id'].isin(invalid_auth_keys)]
-                logger.info(f"Filtered out rows with invalid 'auth_key_id' from 'nodes' table.")
 
-        # Drop foreign key constraints from the SQLite table
-        sqlite_conn.execute(f"PRAGMA foreign_keys = OFF;")
-        logger.info(f"Dropped foreign key constraints for table '{table_name}'.")
+                # Set invalid 'auth_key_id's to NULL
+                df.loc[invalid_mask, 'auth_key_id'] = pd.NA
+
+            logger.info(f"Final DataFrame row count for '{table_name}' after processing: {len(df)}")
 
         # Insert into SQLite
         try:
             df.to_sql(table_name, sqlite_conn, if_exists='append', index=False)
-            logger.info(f"Successfully migrated table '{table_name}' with {row_count} rows.")
+
+            # Verify the number of rows inserted
+            cursor = sqlite_conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            actual_count = cursor.fetchone()[0]
+            logger.info(f"Actually inserted {actual_count} rows into SQLite table '{table_name}'.")
+
+            if actual_count != len(df):
+                logger.warning(f"Discrepancy in row count for table '{table_name}'. Expected: {len(df)}, Actual: {actual_count}")
+
         except sqlite3.IntegrityError as e:
             logger.error(f"IntegrityError migrating table '{table_name}': {e}")
         except Exception as e:
@@ -336,16 +342,17 @@ def main():
 
         for table in TABLES:
             migrate_table(pg_conn, sqlite_conn, table)
+
     except Exception as e:
-       logger.error(f"Unexpected error during migration: {e}")
+        logger.error(f"Unexpected error during migration: {e}")
     finally:
         # Re-enable foreign keys if they were disabled
         if DISABLE_FOREIGN_KEYS:
             try:
-                sqlite_conn.execute("PRAGMA foreign_keys = OFF;")  # Keeping foreign keys disabled
-                logger.info("Foreign key constraints kept DISABLED in SQLite.")
+                sqlite_conn.execute("PRAGMA foreign_keys = ON;")
+                logger.info("Foreign key constraints ENABLED in SQLite.")
             except Exception as e:
-                logger.error(f"Failed to disable foreign key constraints: {e}")
+                logger.error(f"Failed to enable foreign key constraints: {e}")
         pg_conn.close()
         sqlite_conn.close()
         logger.info("Migration process completed.")
