@@ -1,5 +1,8 @@
 # headscalebacktosqlite
-I've made and tested this script to help me go from a v0.23.0 PSQL instance back to SQLITE
+I've made and tested this script to help me go from a v0.23.0 PSQL instance back to SQLITE (convert.py)
+EDIT 2025-04-01
+I've also made one to convert v0.22.3 (22.3_only.py) - this one can take up to 4 arguments:
+python 22.3_only.py {username/schema_namespace} {password} {server_url/ip} {database_name}
 
 Obviously take backups before you do this.
 
